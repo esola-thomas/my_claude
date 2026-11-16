@@ -1,26 +1,23 @@
 #!/usr/bin/env bash
-# Install my_claude under a prefix (default ~/.local). No sudo, no network.
+# Install my_claude under a prefix (default ~/.local). No sudo.
 set -euo pipefail
 
 prefix="$HOME/.local"
-seed=1
-link=0
+deps=1
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
   cat <<USAGE
-Usage: ./install.sh [--prefix DIR] [--no-agents] [--symlink]
+Usage: ./install.sh [--prefix DIR] [--no-deps]
   --prefix DIR  install under DIR (default: \$HOME/.local)
-  --no-agents   do not copy example packs into the config directory
-  --symlink     link bin/my_claude to this checkout instead of copying (for development)
+  --no-deps     do not create the Python environment (run 'my_claude install-deps' later)
 USAGE
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --prefix) [ $# -ge 2 ] || { echo "--prefix needs a directory" >&2; exit 2; }; prefix="$2"; shift 2 ;;
-    --no-agents) seed=0; shift ;;
-    --symlink) link=1; shift ;;
+    --no-deps) deps=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -32,19 +29,15 @@ if [ "${BASH_VERSINFO[0]}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${
 fi
 
 bindir="$prefix/bin"
-libdir="$prefix/lib/my_claude"
-sharedir="$prefix/share/my_claude/agents"
-mkdir -p "$bindir" "$libdir" "$sharedir"
+share="$prefix/share/my_claude"
+mkdir -p "$bindir" "$share/lib" "$share/libexec"
 
-if [ "$link" -eq 1 ]; then
-  ln -sf "$here/bin/my_claude" "$bindir/my_claude"
-else
-  install -m 755 "$here/bin/my_claude" "$bindir/my_claude"
-fi
-install -m 644 "$here/lib/my_claude/doctor.sh" "$libdir/doctor.sh"
-for f in "$here"/agents/*.md; do
-  install -m 644 "$f" "$sharedir/$(basename "$f")"
-done
+install -m 755 "$here/bin/my_claude" "$bindir/my_claude"
+install -m 644 "$here/lib/doctor.sh" "$share/lib/doctor.sh"
+install -m 644 "$here/libexec/sync_models.py" "$share/libexec/sync_models.py"
+install -m 644 "$here/libexec/dashboard.py" "$share/libexec/dashboard.py"
+install -m 644 "$here/pyproject.toml" "$share/pyproject.toml"
+install -m 644 "$here/uv.lock" "$share/uv.lock"
 echo "Installed my_claude to $bindir/my_claude"
 
 case ":$PATH:" in
@@ -56,15 +49,13 @@ case ":$PATH:" in
     ;;
 esac
 
-if [ "$seed" -eq 1 ]; then
+if [ "$deps" -eq 1 ]; then
   echo
-  MY_CLAUDE_CONFIG_DIR="${MY_CLAUDE_CONFIG_DIR:-}" "$bindir/my_claude" init
+  "$bindir/my_claude" install-deps
 fi
 
 echo
-echo "Running my_claude doctor:"
-"$bindir/my_claude" doctor || {
-  echo
-  echo "doctor reported failures. Fix them, then run: my_claude doctor"
-  exit 1
-}
+echo "Next steps:"
+echo "  my_claude login     sign in to GitHub Copilot (one time)"
+echo "  my_claude doctor    check the setup"
+echo "  my_claude           start Claude Code"

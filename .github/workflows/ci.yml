@@ -9,6 +9,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck -x bin/my_claude lib/my_claude/doctor.sh install.sh uninstall.sh tests/smoke.sh tests/fakebin/claude
+        run: shellcheck -x bin/my_claude lib/doctor.sh install.sh uninstall.sh tests/smoke.sh tests/fakebin/claude tests/fakebin/uv
+      - name: unit tests
+        run: python3 tests/test_sync.py
       - name: smoke tests
         run: bash tests/smoke.sh

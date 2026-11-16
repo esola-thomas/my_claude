@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# my_claude: launch Claude Code with a chosen knowledge pack appended to the system prompt.
+set -euo pipefail
+
+VERSION="0.1.0"
+CONFIG_DIR="${MY_CLAUDE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/my_claude}"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SELF_DIR="$(dirname "$SELF")"
+PACK_WARN_BYTES=100000
+PACK_MAX_BYTES=1000000
+
+die() { echo "my_claude: $*" >&2; exit 1; }
+
+usage() {
+  cat <<USAGE
+my_claude $VERSION: run Claude Code with a knowledge pack loaded.
+
+Usage:
+  my_claude [-a PACK] [-p] [prompt...] [-- claude-args...]
+  my_claude doctor [--probe]
+  my_claude list
+  my_claude show PACK
+  my_claude new PACK
+  my_claude init
+
+Options:
+  -a, --agent PACK   Pack to load (default: \$MY_CLAUDE_DEFAULT_AGENT, else 'example', else first found)
+  -p, --print        Non-interactive single answer; reads stdin if no prompt and stdin is piped
+  -h, --help         This help
+  --version          Print version
+
+Everything after '--' is passed to claude unchanged (for example: -- --model opus).
+Packs are markdown files in: $CONFIG_DIR
+Packs are sent to Anthropic as part of the system prompt. Do not put secrets in them.
+USAGE
+}
+
+pack_names() {
+  local f
+  for f in "$CONFIG_DIR"/*.md; do
+    [ -f "$f" ] || continue
+    basename "$f" .md
+  done
+}
+
+default_pack() {
+  local first
+  if [ -n "${MY_CLAUDE_DEFAULT_AGENT:-}" ]; then echo "$MY_CLAUDE_DEFAULT_AGENT"; return; fi
+  if [ -f "$CONFIG_DIR/example.md" ]; then echo example; return; fi
+  first="$(pack_names | sed -n 1p)" || true
+  echo "$first"
+}
+
+cmd_list() {
+  local n title
+  echo "Packs in $CONFIG_DIR:"
+  local found=0
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    found=1
+    title="$(sed -n '1s/^# *//p' "$CONFIG_DIR/$n.md")"
+    printf '  %-32s %s\n' "$n" "$title"
+  done < <(pack_names)
+  [ "$found" -eq 1 ] || echo "  (none) run: my_claude init"
+}
+
+cmd_show() {
+  [ $# -ge 1 ] || die "show needs a pack name"
+  [ -f "$CONFIG_DIR/$1.md" ] || die "pack '$1' not found in $CONFIG_DIR"
+  cat "$CONFIG_DIR/$1.md"
+}
+
+cmd_new() {
+  [ $# -ge 1 ] || die "new needs a pack name"
+  local name="$1" dest tmpl
+  case "$name" in *[!A-Za-z0-9._-]*|"") die "pack name may only contain letters, digits, . _ -" ;; esac
+  dest="$CONFIG_DIR/$name.md"
+  [ ! -e "$dest" ] || die "$dest already exists"
+  mkdir -p "$CONFIG_DIR"
+  tmpl="$(find_shipped example.md)" || die "example template not found; reinstall my_claude"
+  cp "$tmpl" "$dest"
+  echo "Created $dest"
+}
+
+# Locate a shipped pack: installed share dir, or the repo checkout next to bin/.
+find_shipped() {
+  local d
+  for d in "$SELF_DIR/../share/my_claude/agents" "$SELF_DIR/../agents"; do
+    if [ -f "$d/$1" ]; then echo "$d/$1"; return 0; fi
+  done
+  return 1
+}
+
+shipped_dir() {
+  local d
+  for d in "$SELF_DIR/../share/my_claude/agents" "$SELF_DIR/../agents"; do
+    if [ -d "$d" ]; then echo "$d"; return 0; fi
+  done
+  return 1
+}
+
+cmd_init() {
+  local src f dest n=0
+  src="$(shipped_dir)" || die "shipped packs not found; reinstall my_claude"
+  mkdir -p "$CONFIG_DIR"
+  for f in "$src"/*.md; do
+    [ -f "$f" ] || continue
+    dest="$CONFIG_DIR/$(basename "$f")"
+    if [ -e "$dest" ]; then
+      echo "skip (exists): $dest"
+    else
+      cp "$f" "$dest"; echo "installed:     $dest"; n=$((n + 1))
+    fi
+  done
+  echo "$n pack(s) installed."
+}
+
+if [ "${1:-}" = "doctor" ]; then
+  shift
+  # shellcheck source=/dev/null
+  . "$SELF_DIR/../lib/my_claude/doctor.sh"
+  run_doctor "$@"
+  exit $?
+fi
+
+agent=""
+print_mode=0
+prompt_args=()
+extra=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --version) echo "my_claude $VERSION"; exit 0 ;;
+    list) [ ${#prompt_args[@]} -eq 0 ] || { prompt_args+=("$1"); shift; continue; }; cmd_list; exit 0 ;;
+    show) [ ${#prompt_args[@]} -eq 0 ] || { prompt_args+=("$1"); shift; continue; }; shift; cmd_show "$@"; exit 0 ;;
+    new)  [ ${#prompt_args[@]} -eq 0 ] || { prompt_args+=("$1"); shift; continue; }; shift; cmd_new "$@"; exit 0 ;;
+    init) [ ${#prompt_args[@]} -eq 0 ] || { prompt_args+=("$1"); shift; continue; }; cmd_init; exit 0 ;;
+    -a|--agent)
+      [ $# -ge 2 ] || die "$1 needs a pack name"
+      agent="$2"; shift 2 ;;
+    -p|--print) print_mode=1; shift ;;
+    --) shift; extra=("$@"); break ;;
+    -*) die "unknown option '$1' (use -- to pass options to claude)" ;;
+    *) prompt_args+=("$1"); shift ;;
+  esac
+done
+
+command -v claude >/dev/null 2>&1 || die "claude not found on PATH. Install Claude Code, then run: my_claude doctor"
+
+[ -n "$agent" ] || agent="$(default_pack)"
+[ -n "$agent" ] || die "no packs found in $CONFIG_DIR. Run: my_claude init"
+pack="$CONFIG_DIR/$agent.md"
+[ -f "$pack" ] || die "pack '$agent' not found at $pack (try: my_claude list)"
+
+size="$(wc -c < "$pack")"
+[ "$size" -le "$PACK_MAX_BYTES" ] || die "pack is $size bytes, over the $PACK_MAX_BYTES byte limit"
+[ "$size" -le "$PACK_WARN_BYTES" ] || echo "my_claude: warning: pack is $size bytes" >&2
+
+echo "my_claude: pack $pack" >&2
+
+cmd=(claude --append-system-prompt-file "$pack")
+help_text="$(claude --help 2>&1 || true)"
+case "$help_text" in *--name*) cmd+=(--name "expert:$agent") ;; esac
+
+if [ "$print_mode" -eq 1 ]; then
+  cmd+=(-p)
+  if [ ${#prompt_args[@]} -eq 0 ]; then
+    [ ! -t 0 ] || die "-p needs a prompt argument or piped stdin"
+    prompt_args=("$(cat)")
+  fi
+fi
+
+[ ${#extra[@]} -eq 0 ] || cmd+=("${extra[@]}")
+[ ${#prompt_args[@]} -eq 0 ] || cmd+=("${prompt_args[*]}")
+exec "${cmd[@]}"

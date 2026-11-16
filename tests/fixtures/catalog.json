@@ -1,0 +1,9 @@
+{"data":[
+ {"id":"claude-opus-5.5","policy":{"state":"enabled"},"capabilities":{"limits":{"max_context_window_tokens":1000000,"max_output_tokens":64000}}},
+ {"id":"claude-opus-5.0","policy":{"state":"enabled"},"capabilities":{"limits":{"max_context_window_tokens":200000,"max_output_tokens":32000}}},
+ {"id":"claude-sonnet-5.5","policy":{"state":"enabled"},"capabilities":{"limits":{"max_context_window_tokens":1000000,"max_output_tokens":64000}}},
+ {"id":"claude-haiku-5.5","policy":{"state":"enabled"},"capabilities":{"limits":{"max_context_window_tokens":200000,"max_output_tokens":32000}}},
+ {"id":"gpt-6-luna","policy":{"state":"enabled"},"capabilities":{"limits":{"max_context_window_tokens":400000,"max_output_tokens":128000}}},
+ {"id":"gpt-6-sol-fast","policy":{"state":"enabled"}},
+ {"id":"claude-opus-9","policy":{"state":"disabled"}}
+]}

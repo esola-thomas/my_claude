@@ -45,7 +45,7 @@ Use `git clone`, not a zip download, so the executable bits are kept.
 my_claude                          # interactive Claude Code
 my_claude -p "explain this repo"   # one-shot
 my_claude --dashboard              # also start the local dashboard
-my_claude --model sol              # any claude option works
+my_claude --model gpt-sol-latest  # any claude option works
 my_claude -- --resume              # everything after -- goes to claude unchanged
 ```
 
@@ -64,12 +64,14 @@ Commands: `login [--force]`, `install-deps`, `doctor`, `status`, `stop`, `stop-a
 
 Each launch discovers the newest enabled model per family and generates the routes. Claude Opus, Sonnet and Haiku are required. GPT Astra, Sol and Luna are used when your account has them.
 
-| Claude Code alias | Route |
+| Select with | Route |
 |---|---|
-| `opus`, `deep`, `standard` | newest enabled Claude Opus (`[1m]` profile when it has a 1M window) |
-| `sonnet`, `fast` | newest enabled Claude Sonnet |
-| `haiku` | newest enabled Claude Haiku |
-| `astra`, `sol`, `luna`, `cheap` | newest enabled GPT Astra, Sol, Luna (when present) |
+| `opus` / `sonnet` / `haiku` (built in) | newest enabled Claude Opus, Sonnet, Haiku (`[1m]` profile when the window is 1M) |
+| `--model gpt-astra-latest` | newest enabled GPT Astra (when your account has it) |
+| `--model gpt-sol-latest` | newest enabled GPT Sol |
+| `--model gpt-luna-latest` | newest enabled GPT Luna |
+
+The GPT routes are also listed in the `/model` picker. Claude Code has no user-defined short aliases, so use the full route names above.
 
 Set `MY_CLAUDE_PRIMARY=claude-opus-5.0` to pin the primary Opus model.
 

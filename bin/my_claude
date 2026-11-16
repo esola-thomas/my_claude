@@ -29,6 +29,7 @@ KEY_FILE="$STATE/key"
 CONFIG="$STATE/config.yaml"
 ENV_FILE="$STATE/models.env"
 SETTINGS="$STATE/settings.json"
+LAUNCH_SETTINGS="$STATE/launch.json"
 MCP_FILE="$STATE/mcp.json"
 PROXY_PID="$STATE/proxy.pid"
 DASH_PID="$STATE/dashboard.pid"
@@ -331,7 +332,9 @@ export NO_PROXY="127.0.0.1${NO_PROXY:+,$NO_PROXY}"
 export no_proxy="$NO_PROXY"
 unset DISABLE_NON_ESSENTIAL_MODEL_CALLS CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC MY_CLAUDE_KEY
 
-cmd=("$CLAUDE_BIN" --settings "$SETTINGS")
+printf '{"env":{"ANTHROPIC_BASE_URL":"%s","ANTHROPIC_AUTH_TOKEN":"%s"}}\n' "$URL" "$KEY" > "$LAUNCH_SETTINGS.tmp"
+mv "$LAUNCH_SETTINGS.tmp" "$LAUNCH_SETTINGS"
+cmd=("$CLAUDE_BIN" --settings "$SETTINGS" --settings "$LAUNCH_SETTINGS")
 if [ "$use_mcp_file" -eq 1 ] && [ -f "$MCP_FILE" ]; then
   cmd+=(--strict-mcp-config --mcp-config "$MCP_FILE")
 fi

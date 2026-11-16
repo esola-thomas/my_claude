@@ -232,29 +232,20 @@ def build_settings(selections: dict[str, dict[str, Any]]) -> dict[str, Any]:
 
     available = [primary_profile, opus_latest_profile, sonnet_profile, haiku]
     options = []
-    aliases = {
-        "haiku": haiku,
-        "opus": primary_profile,
-        "sonnet": sonnet_profile,
-        "deep": primary_profile,
-        "fast": sonnet_profile,
-        "standard": primary_profile,
-    }
     gpt_meta = {
-        "gpt_astra_latest": ("astra", "GPT Astra", primary_profile,
+        "gpt_astra_latest": ("GPT Astra", primary_profile,
                              "Highest-capability OpenAI model for complex implementation and review."),
-        "gpt_sol_latest": ("sol", "GPT Sol", sonnet_profile,
+        "gpt_sol_latest": ("GPT Sol", sonnet_profile,
                            "Balanced OpenAI model for everyday coding and agent work."),
-        "gpt_luna_latest": ("luna", "GPT Luna", sonnet_profile,
+        "gpt_luna_latest": ("GPT Luna", sonnet_profile,
                             "Fast, low-cost OpenAI model for lightweight and high-volume tasks."),
     }
     for key, alias in GPT_ALIASES:
         if key not in selections:
             continue
-        short, label, behaves_as, description = gpt_meta[key]
+        label, behaves_as, description = gpt_meta[key]
         model_id = str(selections[key]["id"])
         available.extend([alias, model_id])
-        aliases[short] = alias
         options.append(
             {
                 "model": alias,
@@ -263,12 +254,9 @@ def build_settings(selections: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 "behavesAs": behaves_as,
             }
         )
-    if "gpt_luna_latest" in selections:
-        aliases["cheap"] = "gpt-luna-latest"
 
     settings: dict[str, Any] = {
         "availableModels": list(dict.fromkeys(available)),
-        "modelAliases": aliases,
         "env": {
             "ANTHROPIC_MODEL": primary_profile,
             "ANTHROPIC_DEFAULT_OPUS_MODEL": primary_profile,

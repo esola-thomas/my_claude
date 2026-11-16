@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Test stub for the claude CLI: records argv, answers --help/--version/auth.
+if [ -n "${FAKE_CLAUDE_LOG:-}" ]; then printf '%s\n' "$@" > "$FAKE_CLAUDE_LOG"; fi
+case "${1:-}" in
+  --version) echo "9.9.9 (fake)"; exit 0 ;;
+  --help) echo "  --append-system-prompt[-file]"; echo "  -n, --name <name>"; exit 0 ;;
+  auth) exit 0 ;;
+esac
+exit 0

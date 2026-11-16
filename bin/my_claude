@@ -1,176 +1,355 @@
 #!/usr/bin/env bash
-# my_claude: launch Claude Code with a chosen knowledge pack appended to the system prompt.
+# my_claude: run Claude Code through a local LiteLLM proxy backed by GitHub Copilot.
 set -euo pipefail
 
 VERSION="0.1.0"
-CONFIG_DIR="${MY_CLAUDE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/my_claude}"
+
+if [ "${BASH_VERSINFO[0]}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 4 ]; }; then
+  echo "my_claude: bash 4.4 or newer is required (found $BASH_VERSION)" >&2
+  exit 1
+fi
+
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 SELF_DIR="$(dirname "$SELF")"
-PACK_WARN_BYTES=100000
-PACK_MAX_BYTES=1000000
+if [ -d "$SELF_DIR/../share/my_claude" ]; then
+  SHARE="$(cd "$SELF_DIR/../share/my_claude" && pwd)"
+else
+  SHARE="$(cd "$SELF_DIR/.." && pwd)"
+fi
+
+STATE="${MY_CLAUDE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/my_claude}"
+VENV="${MY_CLAUDE_VENV:-$STATE/venv}"
+PORT="${MY_CLAUDE_PORT:-4141}"
+DASH_PORT="${MY_CLAUDE_DASH_PORT:-$((PORT + 1))}"
+TOKEN_DIR="${GITHUB_COPILOT_TOKEN_DIR:-$HOME/.config/litellm/github_copilot}"
+TOKEN_FILE="$TOKEN_DIR/${GITHUB_COPILOT_ACCESS_TOKEN_FILE:-access-token}"
+URL="http://127.0.0.1:$PORT"
+
+KEY_FILE="$STATE/key"
+CONFIG="$STATE/config.yaml"
+ENV_FILE="$STATE/models.env"
+SETTINGS="$STATE/settings.json"
+MCP_FILE="$STATE/mcp.json"
+PROXY_PID="$STATE/proxy.pid"
+DASH_PID="$STATE/dashboard.pid"
+PROXY_LOG="$STATE/proxy.log"
+DASH_LOG="$STATE/dashboard.log"
+LOCK_FILE="$STATE/lock"
 
 die() { echo "my_claude: $*" >&2; exit 1; }
+note() { echo "my_claude: $*" >&2; }
 
 usage() {
   cat <<USAGE
-my_claude $VERSION: run Claude Code with a knowledge pack loaded.
+my_claude $VERSION: Claude Code through a local LiteLLM proxy backed by GitHub Copilot.
 
 Usage:
-  my_claude [-a PACK] [-p] [prompt...] [-- claude-args...]
-  my_claude doctor [--probe]
-  my_claude list
-  my_claude show PACK
-  my_claude new PACK
-  my_claude init
+  my_claude [options] [claude args...]
+  my_claude install-deps   create the Python environment (uv sync)
+  my_claude login          sign in to GitHub Copilot (device code flow)
+  my_claude doctor         check the setup
+  my_claude status         show proxy and dashboard state
+  my_claude stop           stop the proxy
+  my_claude stop-all       stop the proxy and the dashboard
+  my_claude version
 
-Options:
-  -a, --agent PACK   Pack to load (default: \$MY_CLAUDE_DEFAULT_AGENT, else 'example', else first found)
-  -p, --print        Non-interactive single answer; reads stdin if no prompt and stdin is piped
-  -h, --help         This help
-  --version          Print version
+Options (before the claude args):
+  --dashboard   start the local dashboard and print its URL
+  --all-mcps    ignore \$MY_CLAUDE_HOME/mcp.json and use every configured MCP server
+  --no-sync     skip Copilot model discovery and use the last generated config
+  --            pass everything after it to claude unchanged
 
-Everything after '--' is passed to claude unchanged (for example: -- --model opus).
-Packs are markdown files in: $CONFIG_DIR
-Packs are sent to Anthropic as part of the system prompt. Do not put secrets in them.
+All other arguments go to claude as they are. State directory: $STATE
 USAGE
 }
 
-pack_names() {
-  local f
-  for f in "$CONFIG_DIR"/*.md; do
-    [ -f "$f" ] || continue
-    basename "$f" .md
-  done
+# ---------- helpers ----------
+
+new_key() {
+  local hex
+  hex="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+  printf 'sk-%s\n' "$hex"
 }
 
-default_pack() {
-  local first
-  if [ -n "${MY_CLAUDE_DEFAULT_AGENT:-}" ]; then echo "$MY_CLAUDE_DEFAULT_AGENT"; return; fi
-  if [ -f "$CONFIG_DIR/example.md" ]; then echo example; return; fi
-  first="$(pack_names | sed -n 1p)" || true
-  echo "$first"
+load_key() {
+  [ -f "$KEY_FILE" ] || return 1
+  KEY="$(cat "$KEY_FILE")"
+  [ -n "$KEY" ]
 }
 
-cmd_list() {
-  local n title
-  echo "Packs in $CONFIG_DIR:"
-  local found=0
-  while IFS= read -r n; do
-    [ -n "$n" ] || continue
-    found=1
-    title="$(sed -n '1s/^# *//p' "$CONFIG_DIR/$n.md")"
-    printf '  %-32s %s\n' "$n" "$title"
-  done < <(pack_names)
-  [ "$found" -eq 1 ] || echo "  (none) run: my_claude init"
+ensure_state() {
+  umask 077
+  mkdir -p "$STATE"
+  chmod 700 "$STATE"
+  if [ ! -s "$KEY_FILE" ]; then
+    new_key > "$KEY_FILE"
+  fi
+  load_key
 }
 
-cmd_show() {
-  [ $# -ge 1 ] || die "show needs a pack name"
-  [ -f "$CONFIG_DIR/$1.md" ] || die "pack '$1' not found in $CONFIG_DIR"
-  cat "$CONFIG_DIR/$1.md"
-}
-
-cmd_new() {
-  [ $# -ge 1 ] || die "new needs a pack name"
-  local name="$1" dest tmpl
-  case "$name" in *[!A-Za-z0-9._-]*|"") die "pack name may only contain letters, digits, . _ -" ;; esac
-  dest="$CONFIG_DIR/$name.md"
-  [ ! -e "$dest" ] || die "$dest already exists"
-  mkdir -p "$CONFIG_DIR"
-  tmpl="$(find_shipped example.md)" || die "example template not found; reinstall my_claude"
-  cp "$tmpl" "$dest"
-  echo "Created $dest"
-}
-
-# Locate a shipped pack: installed share dir, or the repo checkout next to bin/.
-find_shipped() {
-  local d
-  for d in "$SELF_DIR/../share/my_claude/agents" "$SELF_DIR/../agents"; do
-    if [ -f "$d/$1" ]; then echo "$d/$1"; return 0; fi
-  done
+pid_is_ours() {
+  # $1 pidfile, $2 string that must appear in the command line
+  local pid cmd uid
+  [ -f "$1" ] || return 1
+  pid="$(cat "$1")"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  uid="$(stat -c %u "/proc/$pid" 2>/dev/null || echo x)"
+  [ "$uid" = "$(id -u)" ] || return 1
+  cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline")"
+  case "$cmd" in *"$2"*) return 0 ;; esac
   return 1
 }
 
-shipped_dir() {
-  local d
-  for d in "$SELF_DIR/../share/my_claude/agents" "$SELF_DIR/../agents"; do
-    if [ -d "$d" ]; then echo "$d"; return 0; fi
-  done
-  return 1
+proxy_owned() { pid_is_ours "$PROXY_PID" "$CONFIG"; }
+dash_owned() { pid_is_ours "$DASH_PID" "dashboard.py"; }
+
+port_in_use() {
+  local out
+  if command -v ss >/dev/null 2>&1; then
+    out="$(ss -ltn "sport = :$1" 2>/dev/null | tail -n +2 || true)"
+    [ -n "$out" ]
+  else
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+  fi
 }
 
-cmd_init() {
-  local src f dest n=0
-  src="$(shipped_dir)" || die "shipped packs not found; reinstall my_claude"
-  mkdir -p "$CONFIG_DIR"
-  for f in "$src"/*.md; do
-    [ -f "$f" ] || continue
-    dest="$CONFIG_DIR/$(basename "$f")"
-    if [ -e "$dest" ]; then
-      echo "skip (exists): $dest"
-    else
-      cp "$f" "$dest"; echo "installed:     $dest"; n=$((n + 1))
-    fi
-  done
-  echo "$n pack(s) installed."
+proxy_healthy() {
+  local body count
+  curl -fsS --noproxy '*' --max-time 3 "$URL/health/readiness" >/dev/null 2>&1 || return 1
+  body="$(curl -fsS --noproxy '*' --max-time 5 "$URL/v1/models" -H "Authorization: Bearer $KEY" 2>/dev/null)" || return 1
+  count="$(grep -o '"id"' <<<"$body" | wc -l || true)"
+  [ "${count:-0}" -gt 0 ]
 }
 
-if [ "${1:-}" = "doctor" ]; then
-  shift
-  # shellcheck source=/dev/null
-  . "$SELF_DIR/../lib/my_claude/doctor.sh"
-  run_doctor "$@"
-  exit $?
-fi
+stop_pid() {
+  # $1 pidfile, $2 label
+  local pid i
+  pid="$(cat "$1")"
+  kill "$pid" 2>/dev/null || true
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+    [ "$i" -lt 10 ] || kill -9 "$pid" 2>/dev/null || true
+  done
+  rm "$1"
+  echo "$2 stopped."
+}
 
-agent=""
-print_mode=0
-prompt_args=()
-extra=()
+cmd_stop() {
+  if proxy_owned; then stop_pid "$PROXY_PID" "LiteLLM proxy"; else
+    [ ! -f "$PROXY_PID" ] || rm "$PROXY_PID"
+    echo "LiteLLM proxy not running (nothing of ours on record)."
+  fi
+}
+
+cmd_stop_all() {
+  cmd_stop
+  if dash_owned; then stop_pid "$DASH_PID" "Dashboard"; else
+    [ ! -f "$DASH_PID" ] || rm "$DASH_PID"
+    echo "Dashboard not running."
+  fi
+}
+
+venv_python() { echo "$VENV/bin/python"; }
+
+copilot_env() {
+  # shellcheck disable=SC2163
+  export GITHUB_COPILOT_TOKEN_DIR="$TOKEN_DIR"
+}
+
+cmd_install_deps() {
+  command -v uv >/dev/null 2>&1 || die "uv not found. Install it from https://docs.astral.sh/uv/getting-started/installation/ and run again."
+  if [ ! -f "$SHARE/pyproject.toml" ] || [ ! -f "$SHARE/uv.lock" ]; then die "pyproject.toml or uv.lock missing in $SHARE"; fi
+  umask 077
+  mkdir -p "$STATE"
+  echo "Creating environment in $VENV (downloads Python 3.12 and LiteLLM if needed)..."
+  UV_PROJECT_ENVIRONMENT="$VENV" uv sync --locked --python 3.12 --project "$SHARE" \
+    || die "uv sync failed. Check network, UV_PYTHON_DOWNLOADS, and any PyPI mirror settings."
+  echo "Environment ready."
+}
+
+cmd_login() {
+  local force=0
+  [ "${1:-}" != "--force" ] || force=1
+  [ -x "$(venv_python)" ] || die "environment missing. Run: my_claude install-deps"
+  copilot_env
+  if [ "$force" -eq 1 ] && [ -f "$TOKEN_FILE" ]; then rm "$TOKEN_FILE"; fi
+  if [ -s "$TOKEN_FILE" ]; then
+    echo "Already signed in ($TOKEN_FILE). Use 'my_claude login --force' to sign in again."
+    return 0
+  fi
+  umask 077
+  "$(venv_python)" -c '
+from litellm.llms.github_copilot.authenticator import Authenticator
+Authenticator().get_access_token()
+' || die "login failed"
+  if [ -s "$TOKEN_FILE" ]; then echo "Signed in. Token stored in $TOKEN_FILE"; else die "login finished but no token file at $TOKEN_FILE"; fi
+}
+
+cmd_status() {
+  ensure_state
+  if proxy_owned; then echo "proxy:     running (pid $(cat "$PROXY_PID")) on $URL"; else echo "proxy:     not running"; fi
+  if proxy_owned && proxy_healthy; then echo "models:    $(grep -o '"id"' < <(curl -fsS --noproxy '*' --max-time 5 "$URL/v1/models" -H "Authorization: Bearer $KEY") | wc -l) routes"; fi
+  if dash_owned; then echo "dashboard: running (pid $(cat "$DASH_PID")) on http://127.0.0.1:$DASH_PORT"; else echo "dashboard: not running"; fi
+  echo "state:     $STATE"
+  if [ -f "$ENV_FILE" ]; then sed 's/^export /  /' "$ENV_FILE"; fi
+}
+
+# ---------- subcommand dispatch ----------
+
+case "${1:-}" in
+  help|-h|--help) usage; exit 0 ;;
+  version|--version) echo "my_claude $VERSION"; exit 0 ;;
+  install-deps) cmd_install_deps; exit 0 ;;
+  login) shift; cmd_login "$@"; exit 0 ;;
+  status) cmd_status; exit 0 ;;
+  stop) ensure_state; cmd_stop; exit 0 ;;
+  stop-all) ensure_state; cmd_stop_all; exit 0 ;;
+  doctor)
+    shift
+    # shellcheck source=lib/doctor.sh
+    . "$SHARE/lib/doctor.sh"
+    run_doctor "$@"
+    exit $?
+    ;;
+esac
+
+# ---------- launch ----------
+
+use_dashboard="${MY_CLAUDE_DASHBOARD:-0}"
+use_mcp_file=1
+do_sync=1
+claude_args=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    -h|--help) usage; exit 0 ;;
-    --version) echo "my_claude $VERSION"; exit 0 ;;
-    list) [ ${#prompt_args[@]} -eq 0 ] || { prompt_args+=("$1"); shift; continue; }; cmd_list; exit 0 ;;
-    show) [ ${#prompt_args[@]} -eq 0 ] || { prompt_args+=("$1"); shift; continue; }; shift; cmd_show "$@"; exit 0 ;;
-    new)  [ ${#prompt_args[@]} -eq 0 ] || { prompt_args+=("$1"); shift; continue; }; shift; cmd_new "$@"; exit 0 ;;
-    init) [ ${#prompt_args[@]} -eq 0 ] || { prompt_args+=("$1"); shift; continue; }; cmd_init; exit 0 ;;
-    -a|--agent)
-      [ $# -ge 2 ] || die "$1 needs a pack name"
-      agent="$2"; shift 2 ;;
-    -p|--print) print_mode=1; shift ;;
-    --) shift; extra=("$@"); break ;;
-    -*) die "unknown option '$1' (use -- to pass options to claude)" ;;
-    *) prompt_args+=("$1"); shift ;;
+    --dashboard) use_dashboard=1; shift ;;
+    --all-mcps) use_mcp_file=0; shift ;;
+    --no-sync) do_sync=0; shift ;;
+    --) claude_args+=("$@"); break ;;
+    *) claude_args+=("$1"); shift ;;
   esac
 done
 
-command -v claude >/dev/null 2>&1 || die "claude not found on PATH. Install Claude Code, then run: my_claude doctor"
+CLAUDE_BIN="${MY_CLAUDE_BIN:-}"
+if [ -z "$CLAUDE_BIN" ]; then CLAUDE_BIN="$(command -v claude || true)"; fi
+if [ -z "$CLAUDE_BIN" ] || [ ! -x "$CLAUDE_BIN" ]; then die "claude not found. Install Claude Code, then run: my_claude doctor"; fi
+command -v curl >/dev/null 2>&1 || die "curl not found"
+if [ ! -x "$(venv_python)" ] || [ ! -x "$VENV/bin/litellm" ]; then die "environment missing. Run: my_claude install-deps"; fi
+[ -s "$TOKEN_FILE" ] || die "not signed in to GitHub Copilot. Run: my_claude login"
 
-[ -n "$agent" ] || agent="$(default_pack)"
-[ -n "$agent" ] || die "no packs found in $CONFIG_DIR. Run: my_claude init"
-pack="$CONFIG_DIR/$agent.md"
-[ -f "$pack" ] || die "pack '$agent' not found at $pack (try: my_claude list)"
+ensure_state
+copilot_env
 
-size="$(wc -c < "$pack")"
-[ "$size" -le "$PACK_MAX_BYTES" ] || die "pack is $size bytes, over the $PACK_MAX_BYTES byte limit"
-[ "$size" -le "$PACK_WARN_BYTES" ] || echo "my_claude: warning: pack is $size bytes" >&2
+exec 9>"$LOCK_FILE"
+flock 9
 
-echo "my_claude: pack $pack" >&2
+models_changed=0
+sync_out=""
+if [ "$do_sync" -eq 1 ]; then
+  if sync_out="$(timeout 60 "$(venv_python)" "$SHARE/libexec/sync_models.py" \
+      --config "$CONFIG" --settings-out "$SETTINGS" --env-file "$ENV_FILE" 2>&1)"; then
+    echo "Copilot models: $sync_out" >&2
+    case "$sync_out" in UPDATED*) models_changed=1 ;; esac
+  elif [ -s "$CONFIG" ] && [ -s "$ENV_FILE" ] && [ -s "$SETTINGS" ]; then
+    note "warning: Copilot model discovery failed; using last generated config."
+    echo "  $sync_out" >&2
+  else
+    die "Copilot model discovery failed and there is no earlier config to fall back on: $sync_out"
+  fi
+else
+  if [ ! -s "$CONFIG" ] || [ ! -s "$ENV_FILE" ] || [ ! -s "$SETTINGS" ]; then die "--no-sync needs an earlier run (config files missing in $STATE)"; fi
+fi
 
-cmd=(claude --append-system-prompt-file "$pack")
-help_text="$(claude --help 2>&1 || true)"
-case "$help_text" in *--name*) cmd+=(--name "expert:$agent") ;; esac
+# shellcheck source=/dev/null
+. "$ENV_FILE"
+PRIMARY="${MY_CLAUDE_PRIMARY_PROFILE:-$MY_CLAUDE_PRIMARY_MODEL}"
+SONNET="${MY_CLAUDE_SONNET_PROFILE:-$MY_CLAUDE_SONNET_MODEL}"
 
-if [ "$print_mode" -eq 1 ]; then
-  cmd+=(-p)
-  if [ ${#prompt_args[@]} -eq 0 ]; then
-    [ ! -t 0 ] || die "-p needs a prompt argument or piped stdin"
-    prompt_args=("$(cat)")
+if proxy_owned && [ "$models_changed" -eq 0 ] && proxy_healthy; then
+  echo "LiteLLM proxy already running on :$PORT, reusing." >&2
+else
+  if proxy_owned; then
+    echo "Restarting LiteLLM proxy (config changed or unhealthy)." >&2
+    stop_pid "$PROXY_PID" "LiteLLM proxy"
+  elif [ -f "$PROXY_PID" ]; then
+    rm "$PROXY_PID"
+  fi
+  if port_in_use "$PORT"; then
+    die "port $PORT is in use by something that is not this tool's proxy. Set MY_CLAUDE_PORT to a free port. Nothing was sent to it."
+  fi
+  echo "Starting LiteLLM proxy on :$PORT..." >&2
+  (
+    cd "$STATE"
+    MY_CLAUDE_KEY="$KEY" setsid nohup "$VENV/bin/litellm" --config "$CONFIG" \
+      --host 127.0.0.1 --port "$PORT" >> "$PROXY_LOG" 2>&1 < /dev/null &
+    echo $! > "$PROXY_PID"
+  )
+  echo -n "Waiting for LiteLLM..." >&2
+  ready=0
+  for _ in $(seq 1 90); do
+    sleep 1
+    if proxy_owned && proxy_healthy; then ready=1; echo " ready." >&2; break; fi
+    echo -n "." >&2
+  done
+  if [ "$ready" -ne 1 ]; then
+    echo " FAILED. Last lines of $PROXY_LOG:" >&2
+    tail -n 40 "$PROXY_LOG" >&2 || true
+    exit 1
   fi
 fi
 
-[ ${#extra[@]} -eq 0 ] || cmd+=("${extra[@]}")
-[ ${#prompt_args[@]} -eq 0 ] || cmd+=("${prompt_args[*]}")
+if [ "$use_dashboard" = "1" ]; then
+  if ! dash_owned; then
+    if port_in_use "$DASH_PORT"; then
+      note "warning: dashboard port $DASH_PORT is busy; skipping dashboard"
+    else
+      (
+        cd "$STATE"
+        MY_CLAUDE_KEY="$KEY" MY_CLAUDE_PORT="$PORT" MY_CLAUDE_DASH_PORT="$DASH_PORT" \
+          setsid nohup "$(venv_python)" "$SHARE/libexec/dashboard.py" >> "$DASH_LOG" 2>&1 < /dev/null &
+        echo $! > "$DASH_PID"
+      )
+      sleep 1
+    fi
+  fi
+  echo "Dashboard: http://127.0.0.1:$DASH_PORT/?key=$KEY" >&2
+fi
+
+flock -u 9
+exec 9>&-
+
+export ANTHROPIC_BASE_URL="$URL"
+export ANTHROPIC_AUTH_TOKEN="$KEY"
+export ANTHROPIC_MODEL="$PRIMARY"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$PRIMARY"
+export ANTHROPIC_SMALL_FAST_MODEL="$SONNET"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$SONNET"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MY_CLAUDE_HAIKU_MODEL"
+export NO_PROXY="127.0.0.1${NO_PROXY:+,$NO_PROXY}"
+export no_proxy="$NO_PROXY"
+unset DISABLE_NON_ESSENTIAL_MODEL_CALLS CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC MY_CLAUDE_KEY
+
+cmd=("$CLAUDE_BIN" --settings "$SETTINGS")
+if [ "$use_mcp_file" -eq 1 ] && [ -f "$MCP_FILE" ]; then
+  cmd+=(--strict-mcp-config --mcp-config "$MCP_FILE")
+fi
+if [ ${#claude_args[@]} -gt 0 ]; then cmd+=("${claude_args[@]}"); fi
+
+has_print=0
+has_add_dir=0
+for a in ${claude_args[@]+"${claude_args[@]}"}; do
+  case "$a" in
+    -p|--print) has_print=1 ;;
+    --add-dir) has_add_dir=1 ;;
+  esac
+done
+
+if [ "$has_print" -eq 1 ] && [ ! -t 0 ] && [ "${MY_CLAUDE_KEEP_STDIN:-0}" != "1" ]; then
+  if [ "$has_add_dir" -eq 1 ]; then
+    note "warning: --add-dir is variadic and may swallow your prompt. Put the prompt before --add-dir, or end the list with --."
+  fi
+  exec "${cmd[@]}" < /dev/null
+fi
 exec "${cmd[@]}"
